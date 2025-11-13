@@ -1,0 +1,7 @@
+{
+  "networkRoot": "../fabric-test-env/fabric-samples/veridat-network",
+  "channelName": "paralite",
+  "chaincodeName": "hashcc",
+  "mspId": "VeridatMSP",
+  "port": 3000
+}
