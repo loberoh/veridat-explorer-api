@@ -1,5 +1,7 @@
 const express = require('express');
-const { Gateway, Wallets } = require('fabric-network');
+const { connect, signers } = require('@hyperledger/fabric-gateway');
+const grpc = require('@grpc/grpc-js');
+const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 
@@ -9,210 +11,290 @@ app.use(express.json());
 // Load configuration
 const config = require('./config.json');
 
-// Build connection profile
-function buildConnectionProfile() {
-    const ccpPath = path.resolve(
-        __dirname,
-        config.networkRoot, 
-        'organizations', 
-        'peerOrganizations', 
-        'veridat.example.com', 
-        'connection-veridat.json'
+// Helper to read files safely
+function resolvePath(relativePath) {
+    return path.resolve(__dirname, config.networkRoot, relativePath);
+}
+
+// 1. CREATE GRPC CLIENT (Replaces Connection Profile)
+async function createGrpcClient() {
+    const tlsCertPath = resolvePath(
+        'organizations/peerOrganizations/veridat.example.com/peers/peer0.veridat.example.com/tls/ca.crt'
     );
-    
-    // If connection profile doesn't exist, create it manually
-    if (!fs.existsSync(ccpPath)) {
-        console.log('⚠️  Connection profile not found, using default configuration');
-        
-        const tlsCertPath = path.resolve(
-            __dirname,
-            config.networkRoot,
-            'organizations/peerOrganizations/veridat.example.com/peers/peer0.veridat.example.com/tls/ca.crt'
-        );
-        
-        console.log('🔍 Using peer port: 7056');
-        
-        return {
-            name: 'veridat-network',
-            version: '1.0.0',
-            client: {
-                organization: 'Veridat',
-                connection: {
-                    timeout: {
-                        peer: { endorser: '300' },
-                        orderer: '300'
-                    }
-                }
-            },
-            channels: {
-                paralite: {
-                    peers: {
-                        'peer0.veridat.example.com': {
-                            endorsingPeer: true,
-                            chaincodeQuery: true,
-                            ledgerQuery: true,
-                            eventSource: true
-                        }
-                    }
-                }
-            },
-            organizations: {
-                Veridat: {
-                    mspid: 'VeridatMSP',
-                    peers: ['peer0.veridat.example.com'],
-                    certificateAuthorities: ['ca.veridat.example.com']
-                }
-            },
-            peers: {
-                'peer0.veridat.example.com': {
-                    url: 'grpcs://localhost:7056',
-                    tlsCACerts: {
-                        pem: fs.readFileSync(tlsCertPath).toString()
-                    },
-                    grpcOptions: {
-                        'ssl-target-name-override': 'peer0.veridat.example.com',
-                        'hostnameOverride': 'peer0.veridat.example.com'
-                    }
-                }
-            }
-        };
-    }
-    
-    const contents = fs.readFileSync(ccpPath, 'utf8');
-    return JSON.parse(contents);
-}
 
-// Build wallet with admin identity
-async function buildWallet() {
-    const walletPath = path.join(__dirname, 'wallet');
-    const wallet = await Wallets.newFileSystemWallet(walletPath);
-
-    // Check if identity exists
-    const identity = await wallet.get('appUser');
-    if (!identity) {
-        console.log('📝 Creating appUser identity in wallet...');
-        
-        // Try User1 first (designed for client apps)
-        let credPath = path.resolve(
-            __dirname,
-            config.networkRoot,
-            'organizations/peerOrganizations/veridat.example.com/users/User1@veridat.example.com'
-        );
-        
-        console.log('🔍 Trying User1 credentials at:', credPath);
-        
-        // If User1 doesn't exist, fall back to Admin
-        if (!fs.existsSync(credPath)) {
-            console.log('⚠️  User1 not found, trying Admin...');
-            credPath = path.resolve(
-                __dirname,
-                config.networkRoot,
-                'organizations/peerOrganizations/veridat.example.com/users/Admin@veridat.example.com'
-            );
-        }
-        
-        // Check if path exists
-        if (!fs.existsSync(credPath)) {
-            throw new Error(`Credentials path not found: ${credPath}`);
-        }
-        
-        // Read certificate - find the .pem file in signcerts directory
-        const signcertsPath = path.join(credPath, 'msp/signcerts');
-        if (!fs.existsSync(signcertsPath)) {
-            throw new Error(`Signcerts directory not found at: ${signcertsPath}`);
-        }
-        
-        const certFiles = fs.readdirSync(signcertsPath).filter(f => f.endsWith('.pem'));
-        if (certFiles.length === 0) {
-            throw new Error(`No certificate (.pem) found in: ${signcertsPath}`);
-        }
-        
-        const certPath = path.join(signcertsPath, certFiles[0]);
-        console.log('✅ Found certificate:', certFiles[0]);
-        const certificate = fs.readFileSync(certPath).toString();
-        
-        // Read private key (find the first key in keystore)
-        const keystorePath = path.join(credPath, 'msp/keystore');
-        if (!fs.existsSync(keystorePath)) {
-            throw new Error(`Keystore directory not found at: ${keystorePath}`);
-        }
-        
-        const keyFiles = fs.readdirSync(keystorePath);
-        if (keyFiles.length === 0) {
-            throw new Error(`No private key found in: ${keystorePath}`);
-        }
-        
-        console.log('✅ Found private key:', keyFiles[0]);
-        const privateKey = fs.readFileSync(path.join(keystorePath, keyFiles[0])).toString();
-
-        // Create X.509 identity
-        const x509Identity = {
-            credentials: {
-                certificate: certificate,
-                privateKey: privateKey,
-            },
-            mspId: config.mspId,
-            type: 'X.509',
-        };
-
-        await wallet.put('appUser', x509Identity);
-        console.log('✅ User identity created successfully in wallet');
-    } else {
-        console.log('✅ User identity already exists in wallet');
+    if (!fs.existsSync(tlsCertPath)) {
+        throw new Error(`TLS Root Certificate not found at: ${tlsCertPath}`);
     }
 
-    return wallet;
+    const tlsRootCert = fs.readFileSync(tlsCertPath);
+    const peerEndpoint = 'localhost:7056'; 
+    const hostAlias = 'peer0.veridat.example.com';
+
+    console.log(`🔌 Creating gRPC client to ${peerEndpoint} (override: ${hostAlias})`);
+
+    return new grpc.Client(
+        peerEndpoint,
+        grpc.credentials.createSsl(tlsRootCert),
+        {
+            'grpc.ssl_target_name_override': hostAlias,
+        }
+    );
 }
 
-// Create gateway connection (reusable)
+// 2. LOAD IDENTITY (Replaces buildWallet)
+async function loadIdentity() {
+    let userBaseDir = resolvePath('organizations/peerOrganizations/veridat.example.com/users/User1@veridat.example.com');
+    
+    if (!fs.existsSync(userBaseDir)) {
+        console.log('⚠️  User1 not found, trying Admin...');
+        userBaseDir = resolvePath('organizations/peerOrganizations/veridat.example.com/users/Admin@veridat.example.com');
+    }
+
+    if (!fs.existsSync(userBaseDir)) {
+        throw new Error(`No user credentials found at ${userBaseDir}`);
+    }
+
+    const certDir = path.join(userBaseDir, 'msp/signcerts');
+    const certFiles = fs.readdirSync(certDir).filter(f => f.endsWith('.pem'));
+    if (certFiles.length === 0) throw new Error(`No .pem file found in ${certDir}`);
+    const certPath = path.join(certDir, certFiles[0]);
+    const certificate = fs.readFileSync(certPath);
+
+    const keyDir = path.join(userBaseDir, 'msp/keystore');
+    const keyFiles = fs.readdirSync(keyDir);
+    if (keyFiles.length === 0) throw new Error(`No key found in ${keyDir}`);
+    const keyPath = path.join(keyDir, keyFiles[0]);
+    const privateKeyPem = fs.readFileSync(keyPath);
+    const privateKey = crypto.createPrivateKey(privateKeyPem);
+
+    console.log(`👤 Loaded Identity: ${config.mspId} (${certFiles[0]})`);
+
+    return {
+        mspId: config.mspId,
+        credentials: certificate,
+        privateKey: privateKey
+    };
+}
+
+// 3. CONNECT TO NETWORK
 async function connectToNetwork() {
     try {
-        console.log('🔄 Connecting to Fabric network...');
-        const ccp = buildConnectionProfile();
-        const wallet = await buildWallet();
+        const client = await createGrpcClient();
+        const identity = await loadIdentity();
 
-        const gateway = new Gateway();
-        
-        await gateway.connect(ccp, {
-            wallet,
-            identity: 'appUser',  // ← CHANGED from 'admin' to 'appUser'
-            discovery: { enabled: false }
+        const gateway = connect({
+            client,
+            identity: {
+                mspId: identity.mspId,
+                credentials: identity.credentials,
+            },
+            signer: signers.newPrivateKeySigner(identity.privateKey),
+            evaluateOptions: () => {
+                return { deadline: Date.now() + 5000 };
+            },
+            endorseOptions: () => {
+                return { deadline: Date.now() + 15000 };
+            },
         });
 
         console.log('✅ Gateway connected');
 
-        const network = await gateway.getNetwork(config.channelName);
-        console.log('✅ Network channel obtained:', config.channelName);
-        
+        const network = gateway.getNetwork(config.channelName);
         const contract = network.getContract(config.chaincodeName);
-        console.log('✅ Contract obtained:', config.chaincodeName);
 
-        return { gateway, network, contract };
+        return { gateway, client, contract, network };
     } catch (error) {
-        console.error('❌ Failed to connect to network:', error.message);
-        console.error('Full error:', error);
+        console.error('❌ Connection failed:', error);
         throw error;
     }
 }
 
+// 4. MANUAL PROTOBUF PARSING (NO LIBRARY NEEDED!)
+
+// Decode varint (variable-length integer) from buffer
+function decodeVarint(buffer, offset) {
+    let result = 0;
+    let shift = 0;
+    let byte;
+    let pos = offset;
+    
+    do {
+        if (pos >= buffer.length) {
+            throw new Error('Varint extends beyond buffer');
+        }
+        byte = buffer[pos++];
+        result |= (byte & 0x7f) << shift;
+        shift += 7;
+    } while (byte & 0x80);
+    
+    return { value: result, bytesRead: pos - offset };
+}
+
+// Enhanced: Parse multiple fields from block
+function parseBlockData(blockBytes) {
+    try {
+        let pos = 0;
+        const result = {
+            blockNumber: null,
+            previousHash: null,
+            dataHash: null,
+            transactionCount: 0
+        };
+        
+        // Field 1: Header (0x0a = field 1, wire type 2 - length-delimited)
+        if (blockBytes[pos] !== 0x0a) {
+            throw new Error('Expected header field');
+        }
+        pos++;
+        
+        const headerLength = decodeVarint(blockBytes, pos);
+        pos += headerLength.bytesRead;
+        const headerStart = pos;
+        const headerEnd = pos + headerLength.value;
+        
+        // Parse header contents
+        while (pos < headerEnd) {
+            const fieldTag = blockBytes[pos];
+            
+            if (fieldTag === 0x08) {
+                // Field 1: Block number (varint)
+                pos++;
+                const blockNum = decodeVarint(blockBytes, pos);
+                result.blockNumber = blockNum.value;
+                pos += blockNum.bytesRead;
+            } else if (fieldTag === 0x12) {
+                // Field 2: Previous hash (length-delimited)
+                pos++;
+                const hashLen = decodeVarint(blockBytes, pos);
+                pos += hashLen.bytesRead;
+                result.previousHash = Buffer.from(blockBytes.slice(pos, pos + hashLen.value)).toString('hex');
+                pos += hashLen.value;
+            } else if (fieldTag === 0x1a) {
+                // Field 3: Data hash (length-delimited)
+                pos++;
+                const hashLen = decodeVarint(blockBytes, pos);
+                pos += hashLen.bytesRead;
+                result.dataHash = Buffer.from(blockBytes.slice(pos, pos + hashLen.value)).toString('hex');
+                pos += hashLen.value;
+            } else {
+                // Unknown field, skip
+                pos++;
+            }
+        }
+        
+        // Field 2: Data (0x12 = field 2, wire type 2)
+        pos = headerEnd;
+        if (pos < blockBytes.length && blockBytes[pos] === 0x12) {
+            pos++;
+            const dataLength = decodeVarint(blockBytes, pos);
+            pos += dataLength.bytesRead;
+            
+            // Count transactions (each transaction is a length-delimited field)
+            const dataEnd = pos + dataLength.value;
+            let txCount = 0;
+            while (pos < dataEnd) {
+                if (blockBytes[pos] === 0x0a) { // Transaction field
+                    txCount++;
+                    pos++;
+                    const txLen = decodeVarint(blockBytes, pos);
+                    pos += txLen.bytesRead + txLen.value;
+                } else {
+                    break;
+                }
+            }
+            result.transactionCount = txCount;
+        }
+        
+        return result;
+        
+    } catch (error) {
+        console.error('Error parsing block data:', error.message);
+        return {
+            blockNumber: null,
+            previousHash: null,
+            dataHash: null,
+            transactionCount: 0,
+            error: error.message
+        };
+    }
+}
+
+// 5. GET BLOCK INFO FROM TRANSACTION ID
+async function getBlockInfoFromTxId(network, txId) {
+    try {
+        console.log(`📦 Querying block for transaction: ${txId}`);
+        const qscc = network.getContract('qscc');
+        
+        const blockBytes = await qscc.evaluateTransaction(
+            'GetBlockByTxID',
+            config.channelName,
+            txId
+        );
+        
+        // Parse comprehensive block data
+        const blockData = parseBlockData(blockBytes);
+        
+        return {
+            success: true,
+            transactionId: txId,
+            blockNumber: blockData.blockNumber,
+            previousBlockHash: blockData.previousHash,
+            dataHash: blockData.dataHash,
+            transactionCount: blockData.transactionCount,
+            blockSize: blockBytes.length,
+            channel: config.channelName
+        };
+        
+    } catch (error) {
+        console.error(`❌ Could not fetch block: ${error.message}`);
+        return { 
+            success: false, 
+            error: error.message 
+        };
+    }
+}
+
+// 6. GET BLOCKCHAIN INFO
+async function getChainInfo(network) {
+    try {
+        const qscc = network.getContract('qscc');
+        
+        const infoBytes = await qscc.evaluateTransaction(
+            'GetChainInfo',
+            config.channelName
+        );
+        
+        return {
+            success: true,
+            channel: config.channelName,
+            dataSize: infoBytes.length,
+            infoHex: Buffer.from(infoBytes.slice(0, 32)).toString('hex')
+        };
+        
+    } catch (error) {
+        console.error(`❌ Could not fetch chain info: ${error.message}`);
+        return { success: false, error: error.message };
+    }
+}
+
+// ===== ROUTES =====
+
 // Get all hashes
 app.get('/api/hashes', async (req, res) => {
     let gateway;
+    let client;
     try {
         console.log('📊 Querying all hashes...');
         const connection = await connectToNetwork();
         gateway = connection.gateway;
+        client = connection.client;
         const contract = connection.contract;
 
-        console.log('📞 Calling GetAllHashes function...');
-        const result = await contract.evaluateTransaction('GetAllHashes');
-        console.log('📦 Raw result:', result.toString());
+        const resultBytes = await contract.evaluateTransaction('GetAllHashes');
+        const resultString = new TextDecoder().decode(resultBytes);
         
-        const data = JSON.parse(result.toString());
-        console.log('✅ Parsed data:', JSON.stringify(data, null, 2));
-
-        await gateway.disconnect();
-        console.log('✅ Query successful');
+        console.log('📦 Raw result:', resultString);
+        const data = JSON.parse(resultString);
 
         res.json({
             success: true,
@@ -220,200 +302,162 @@ app.get('/api/hashes', async (req, res) => {
             data: data.data || [],
             timestamp: new Date().toISOString()
         });
+
     } catch (error) {
         console.error(`❌ Query failed: ${error.message}`);
-        console.error('❌ Error stack:', error.stack);
-        console.error('❌ Error details:', JSON.stringify(error, null, 2));
-        if (gateway) {
-            try {
-                await gateway.disconnect();
-            } catch (e) {
-                // Ignore disconnect errors
-            }
-        }
-        res.status(500).json({
-            success: false,
-            error: error.message,
-            details: error.toString()
-        });
+        res.status(500).json({ success: false, error: error.message });
+    } finally {
+        if (gateway) gateway.close();
+        if (client) client.close();
     }
 });
 
-// ===== API ENDPOINTS =====
-
-// Health check
-app.get('/health', (req, res) => {
-    res.json({ 
-        status: 'healthy', 
-        timestamp: new Date().toISOString(),
-        network: 'veridat',
-        channel: config.channelName,
-        chaincode: config.chaincodeName
-    });
-});
-
-// API documentation
-app.get('/api', (req, res) => {
-    res.json({
-        name: 'Veridat Explorer API',
-        version: '1.0.0',
-        endpoints: {
-            'GET /': 'Web interface',
-            'GET /health': 'Health check',
-            'GET /api': 'API documentation',
-            'GET /api/hashes': 'Get all stored hashes',
-            'GET /api/hash/:documentId': 'Get hash by document ID',
-            'GET /api/search/:hashValue': 'Search by hash value'
-        }
-    });
-});
-
-// Get all hashes
-// app.get('/api/hashes', async (req, res) => {
-//     let gateway;
-//     try {
-//         console.log('📊 Querying all hashes...');
-//         const connection = await connectToNetwork();
-//         gateway = connection.gateway;
-//         const contract = connection.contract;
-
-//         const result = await contract.evaluateTransaction('GetAllHashes');
-//         const data = JSON.parse(result.toString());
-
-//         await gateway.disconnect();
-//         console.log('✅ Query successful');
-
-//         res.json({
-//             success: true,
-//             count: data.data ? data.data.length : 0,
-//             data: data.data || [],
-//             timestamp: new Date().toISOString()
-//         });
-//     } catch (error) {
-//         console.error(`❌ Query failed: ${error.message}`);
-//         if (gateway) {
-//             try {
-//                 await gateway.disconnect();
-//             } catch (e) {
-//                 // Ignore disconnect errors
-//             }
-//         }
-//         res.status(500).json({
-//             success: false,
-//             error: error.message
-//         });
-//     }
-// });
-
-// Get hash by document ID
+// Get hash by document ID WITH BLOCK INFO
 app.get('/api/hash/:documentId', async (req, res) => {
     let gateway;
+    let client;
     try {
         const { documentId } = req.params;
         console.log(`🔍 Querying document: ${documentId}`);
         
         const connection = await connectToNetwork();
         gateway = connection.gateway;
+        client = connection.client;
         const contract = connection.contract;
+        const network = connection.network;
 
-        // Query all hashes and find the specific one
-        const result = await contract.evaluateTransaction('GetAllHashes');
-        const data = JSON.parse(result.toString());
-
-        await gateway.disconnect();
+        const resultBytes = await contract.evaluateTransaction('GetAllHashes');
+        const resultString = new TextDecoder().decode(resultBytes);
+        const data = JSON.parse(resultString);
 
         if (data.status === 'success' && data.data) {
             const found = data.data.find(item => item.documentID === documentId);
             if (found) {
-                console.log('✅ Document found');
+                // Get block info if transaction ID exists
+                let blockInfo = null;
+                if (found.txId) {
+                    console.log(`🔗 Fetching block info for txId: ${found.txId}`);
+                    blockInfo = await getBlockInfoFromTxId(network, found.txId);
+                }
+                
                 res.json({
                     success: true,
                     data: found,
+                    blockInfo: blockInfo,
                     shareLink: `${req.protocol}://${req.get('host')}/api/hash/${documentId}`
                 });
             } else {
-                console.log('⚠️  Document not found');
-                res.status(404).json({
-                    success: false,
-                    message: `Document ID '${documentId}' not found`
-                });
+                res.status(404).json({ success: false, message: `Document ID '${documentId}' not found` });
             }
         } else {
-            res.status(404).json({
-                success: false,
-                message: 'No data available'
-            });
+            res.status(404).json({ success: false, message: 'No data available' });
         }
     } catch (error) {
         console.error(`❌ Query failed: ${error.message}`);
-        if (gateway) {
-            try {
-                await gateway.disconnect();
-            } catch (e) {
-                // Ignore disconnect errors
-            }
-        }
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        res.status(500).json({ success: false, error: error.message });
+    } finally {
+        if (gateway) gateway.close();
+        if (client) client.close();
     }
 });
 
 // Search by hash value
 app.get('/api/search/:hashValue', async (req, res) => {
     let gateway;
+    let client;
     try {
         const { hashValue } = req.params;
-        console.log(`🔍 Searching for hash: ${hashValue.substring(0, 20)}...`);
         
         const connection = await connectToNetwork();
         gateway = connection.gateway;
+        client = connection.client;
         const contract = connection.contract;
 
-        const result = await contract.evaluateTransaction('GetAllHashes');
-        const data = JSON.parse(result.toString());
-
-        await gateway.disconnect();
+        const resultBytes = await contract.evaluateTransaction('GetAllHashes');
+        const resultString = new TextDecoder().decode(resultBytes);
+        const data = JSON.parse(resultString);
 
         if (data.status === 'success' && data.data) {
             const found = data.data.find(item => item.hash === hashValue);
             if (found) {
-                console.log('✅ Hash found');
-                res.json({
-                    success: true,
-                    data: found
-                });
+                res.json({ success: true, data: found });
             } else {
-                console.log('⚠️  Hash not found');
-                res.status(404).json({
-                    success: false,
-                    message: 'Hash not found'
-                });
+                res.status(404).json({ success: false, message: 'Hash not found' });
             }
         } else {
-            res.status(404).json({
-                success: false,
-                message: 'No data available'
-            });
+            res.status(404).json({ success: false, message: 'No data available' });
         }
     } catch (error) {
         console.error(`❌ Query failed: ${error.message}`);
-        if (gateway) {
-            try {
-                await gateway.disconnect();
-            } catch (e) {
-                // Ignore disconnect errors
-            }
-        }
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        res.status(500).json({ success: false, error: error.message });
+    } finally {
+        if (gateway) gateway.close();
+        if (client) client.close();
     }
 });
 
-// Simple web interface
+// Get blockchain info endpoint
+app.get('/api/blockchain/info', async (req, res) => {
+    let gateway;
+    let client;
+    try {
+        console.log('ℹ️  Querying blockchain info...');
+        
+        const connection = await connectToNetwork();
+        gateway = connection.gateway;
+        client = connection.client;
+        const network = connection.network;
+
+        const chainInfo = await getChainInfo(network);
+        
+        res.json(chainInfo);
+        
+    } catch (error) {
+        console.error(`❌ Query failed: ${error.message}`);
+        res.status(500).json({ success: false, error: error.message });
+    } finally {
+        if (gateway) gateway.close();
+        if (client) client.close();
+    }
+});
+
+// Get block info directly by transaction ID
+app.get('/api/block/txid/:txId', async (req, res) => {
+    let gateway;
+    let client;
+    try {
+        const { txId } = req.params;
+        console.log(`📦 Querying block for transaction: ${txId}`);
+        
+        const connection = await connectToNetwork();
+        gateway = connection.gateway;
+        client = connection.client;
+        const network = connection.network;
+
+        const blockInfo = await getBlockInfoFromTxId(network, txId);
+        
+        res.json(blockInfo);
+        
+    } catch (error) {
+        console.error(`❌ Query failed: ${error.message}`);
+        res.status(500).json({ success: false, error: error.message });
+    } finally {
+        if (gateway) gateway.close();
+        if (client) client.close();
+    }
+});
+
+// Health check
+app.get('/health', (req, res) => {
+    res.json({ 
+        status: 'healthy', 
+        sdk: '@hyperledger/fabric-gateway',
+        timestamp: new Date().toISOString(),
+        channel: config.channelName
+    });
+});
+
+// Web Interface (Updated to show block info)
 app.get('/', (req, res) => {
     res.send(`
         <!DOCTYPE html>
@@ -423,300 +467,115 @@ app.get('/', (req, res) => {
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <style>
-                * { box-sizing: border-box; }
-                body { 
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-                    max-width: 1200px; 
-                    margin: 0 auto; 
-                    padding: 20px;
-                    background: #f5f7fa;
-                }
-                .header { 
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    color: white; 
-                    padding: 30px; 
-                    border-radius: 10px;
-                    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-                }
-                .header h1 { margin: 0 0 10px 0; }
-                .header p { margin: 0; opacity: 0.9; }
-                .search-box { 
-                    margin: 30px 0;
-                    background: white;
-                    padding: 20px;
-                    border-radius: 10px;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                }
-                input { 
-                    padding: 12px; 
-                    width: 400px; 
-                    font-size: 16px;
-                    border: 2px solid #e1e8ed;
-                    border-radius: 5px;
-                }
-                input:focus {
-                    outline: none;
-                    border-color: #667eea;
-                }
-                button { 
-                    padding: 12px 24px; 
-                    font-size: 16px; 
-                    background: #667eea;
-                    color: white; 
-                    border: none;
-                    border-radius: 5px;
-                    cursor: pointer;
-                    margin-left: 10px;
-                    transition: background 0.3s;
-                }
+                body { font-family: sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f7fa; }
+                .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; }
+                .search-box { margin: 30px 0; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+                input { padding: 12px; width: 400px; font-size: 16px; border: 1px solid #ddd; border-radius: 5px; }
+                button { padding: 12px 24px; background: #667eea; color: white; border: none; cursor: pointer; margin-left: 10px; border-radius: 5px;}
                 button:hover { background: #5568d3; }
-                button:disabled {
-                    background: #ccc;
-                    cursor: not-allowed;
-                }
-                .stats {
-                    background: white;
-                    padding: 20px;
-                    border-radius: 10px;
-                    margin-bottom: 20px;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                }
-                .result { 
-                    background: white;
-                    padding: 20px; 
-                    margin: 15px 0; 
-                    border-radius: 10px;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                    transition: transform 0.2s;
-                }
-                .result:hover {
-                    transform: translateY(-2px);
-                    box-shadow: 0 4px 8px rgba(0,0,0,0.15);
-                }
-                .hash { 
-                    font-family: 'Courier New', monospace;
-                    word-break: break-all;
-                    background: #f8f9fa;
-                    padding: 10px;
-                    border-radius: 5px;
-                    margin: 10px 0;
-                    font-size: 14px;
-                }
-                .label { 
-                    font-weight: 600;
-                    color: #667eea;
-                    display: inline-block;
-                    width: 120px;
-                }
-                .loading {
-                    text-align: center;
-                    padding: 40px;
-                    color: #667eea;
-                    font-size: 18px;
-                }
-                .error {
-                    background: #fee;
-                    color: #c33;
-                    padding: 20px;
-                    border-radius: 10px;
-                    margin: 20px 0;
-                }
-                a {
-                    color: #667eea;
-                    text-decoration: none;
-                }
-                a:hover {
-                    text-decoration: underline;
-                }
+                .result { background: white; padding: 20px; margin: 15px 0; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+                .hash { font-family: monospace; background: #f8f9fa; padding: 10px; word-break: break-all; border-radius: 5px; margin: 5px 0; }
+                .block-info { background: #e3f2fd; padding: 15px; margin-top: 15px; border-radius: 5px; font-size: 14px; border-left: 4px solid #2196F3; }
+                .label { font-weight: bold; color: #555; display: inline-block; min-width: 150px; }
+                .value { color: #333; }
+                .info-row { margin: 8px 0; }
             </style>
         </head>
         <body>
             <div class="header">
                 <h1>🔍 Veridat Hash Explorer</h1>
-                <p>Query stored document hashes on the blockchain</p>
+                <p>Query blockchain data with comprehensive block information</p>
             </div>
-            
             <div class="search-box">
-                <input type="text" id="searchInput" placeholder="Enter document ID or hash value" onkeypress="handleKeyPress(event)">
-                <button onclick="search()" id="searchBtn">🔍 Search</button>
-                <button onclick="loadAll()" id="loadAllBtn">📋 Load All</button>
+                <input type="text" id="searchInput" placeholder="Enter document ID or hash value">
+                <button onclick="search()">🔍 Search</button>
+                <button onclick="loadAll()">📋 Load All</button>
             </div>
-            
-            <div class="stats" id="stats" style="display:none;">
-                <strong>Total Records:</strong> <span id="totalRecords">0</span>
-            </div>
-            
             <div id="results"></div>
-            
             <script>
-                let isLoading = false;
-
-                function handleKeyPress(event) {
-                    if (event.key === 'Enter') {
-                        search();
+                async function loadAll() {
+                    document.getElementById('results').innerHTML = 'Loading...';
+                    const res = await fetch('/api/hashes');
+                    const data = await res.json();
+                    display(data.data);
+                }
+                async function search() {
+                    const q = document.getElementById('searchInput').value;
+                    if(!q) return loadAll();
+                    let res = await fetch('/api/hash/'+encodeURIComponent(q));
+                    if(!res.ok) res = await fetch('/api/search/'+encodeURIComponent(q));
+                    if(res.ok) {
+                        const data = await res.json();
+                        displayDetailed(data);
+                    } else {
+                        document.getElementById('results').innerHTML = '<div class="result">Not found</div>';
                     }
                 }
-
-                function setLoading(loading) {
-                    isLoading = loading;
-                    document.getElementById('searchBtn').disabled = loading;
-                    document.getElementById('loadAllBtn').disabled = loading;
-                }
-
-                async function search() {
-                    if (isLoading) return;
-                    
-                    const query = document.getElementById('searchInput').value.trim();
-                    if (!query) { 
-                        loadAll(); 
+                function display(items) {
+                    if(!items || !items.length) { 
+                        document.getElementById('results').innerHTML = '<div class="result">No results</div>'; 
                         return; 
                     }
-                    
-                    showLoading('Searching...');
-                    setLoading(true);
-                    
-                    try {
-                        // Try as document ID first
-                        let response = await fetch(\`/api/hash/\${encodeURIComponent(query)}\`);
-                        if (response.ok) {
-                            const data = await response.json();
-                            displayResults([data.data]);
-                            setLoading(false);
-                            return;
-                        }
-                        
-                        // Try as hash value
-                        response = await fetch(\`/api/search/\${encodeURIComponent(query)}\`);
-                        if (response.ok) {
-                            const data = await response.json();
-                            displayResults([data.data]);
-                        } else {
-                            document.getElementById('results').innerHTML = 
-                                '<div class="result">❌ No results found for: ' + escapeHtml(query) + '</div>';
-                        }
-                    } catch (error) {
-                        document.getElementById('results').innerHTML = 
-                            '<div class="error">❌ Error: ' + escapeHtml(error.message) + '</div>';
-                    } finally {
-                        setLoading(false);
-                    }
+                    document.getElementById('results').innerHTML = items.map(i => 
+                        \`<div class="result">
+                            <div class="info-row"><span class="label">Document ID:</span> <span class="value">\${i.documentID}</span></div>
+                            <div class="info-row"><span class="label">Hash:</span></div>
+                            <div class="hash">\${i.hash}</div>
+                            <div class="info-row"><span class="label">Transaction ID:</span></div>
+                            <div class="hash">\${i.txId || 'N/A'}</div>
+                            <div class="info-row"><span class="label">Timestamp:</span> <span class="value">\${i.timestamp || 'N/A'}</span></div>
+                        </div>\`
+                    ).join('');
                 }
-
-                async function loadAll() {
-                    if (isLoading) return;
-                    
-                    showLoading('Loading all hashes from blockchain...');
-                    setLoading(true);
-                    
-                    try {
-                        const response = await fetch('/api/hashes');
-                        if (!response.ok) {
-                            throw new Error('Failed to fetch hashes: ' + response.statusText);
-                        }
-                        
-                        const data = await response.json();
-                        
-                        if (data.success) {
-                            document.getElementById('stats').style.display = 'block';
-                            document.getElementById('totalRecords').textContent = data.count;
-                            displayResults(data.data);
-                        } else {
-                            throw new Error(data.error || 'Unknown error');
-                        }
-                    } catch (error) {
-                        document.getElementById('results').innerHTML = 
-                            '<div class="error">❌ Error: ' + escapeHtml(error.message) + 
-                            '<br><br>Make sure your Fabric network is running!</div>';
-                    } finally {
-                        setLoading(false);
-                    }
-                }
-
-                function showLoading(message) {
-                    document.getElementById('results').innerHTML = 
-                        '<div class="loading">⏳ ' + escapeHtml(message || 'Loading...') + '</div>';
-                }
-
-                function displayResults(items) {
-                    if (!items || items.length === 0) {
-                        document.getElementById('results').innerHTML = 
-                            '<div class="result">No results found</div>';
+                function displayDetailed(result) {
+                    if(!result || !result.data) {
+                        document.getElementById('results').innerHTML = '<div class="result">No data</div>';
                         return;
                     }
-                    
-                    const html = items.map(item => \`
-                        <div class="result">
-                            <div><span class="label">Document ID:</span> <strong>\${escapeHtml(item.documentID)}</strong></div>
-                            <div><span class="label">Timestamp:</span> \${escapeHtml(item.timestamp)}</div>
-                            <div><span class="label">Hash:</span></div>
-                            <div class="hash">\${escapeHtml(item.hash)}</div>
-                            <div><span class="label">Share Link:</span> 
-                                <a href="/api/hash/\${encodeURIComponent(item.documentID)}" target="_blank">
-                                    \${window.location.origin}/api/hash/\${encodeURIComponent(item.documentID)}
-                                </a>
+                    const i = result.data;
+                    const block = result.blockInfo;
+                    let blockHtml = '';
+                    if(block && block.success) {
+                        blockHtml = \`
+                            <div class="block-info">
+                                <strong>📦 Blockchain Information</strong>
+                                <div class="info-row"><span class="label">Block Number:</span> <strong>\${block.blockNumber}</strong></div>
+                                <div class="info-row"><span class="label">Channel:</span> \${block.channel}</div>
+                                <div class="info-row"><span class="label">Block Size:</span> \${block.blockSize} bytes</div>
+                                <div class="info-row"><span class="label">Transaction Count:</span> \${block.transactionCount}</div>
+                                <div class="info-row"><span class="label">Previous Block Hash:</span></div>
+                                <div class="hash">\${block.previousBlockHash || 'N/A'}</div>
+                                <div class="info-row"><span class="label">Data Hash:</span></div>
+                                <div class="hash">\${block.dataHash || 'N/A'}</div>
                             </div>
+                        \`;
+                    }
+                    document.getElementById('results').innerHTML = \`
+                        <div class="result">
+                            <div class="info-row"><span class="label">Document ID:</span> <span class="value">\${i.documentID}</span></div>
+                            <div class="info-row"><span class="label">Hash:</span></div>
+                            <div class="hash">\${i.hash}</div>
+                            <div class="info-row"><span class="label">Transaction ID:</span></div>
+                            <div class="hash">\${i.txId || 'N/A'}</div>
+                            <div class="info-row"><span class="label">Timestamp:</span> <span class="value">\${i.timestamp || 'N/A'}</span></div>
+                            \${blockHtml}
                         </div>
-                    \`).join('');
-                    
-                    document.getElementById('results').innerHTML = html;
+                    \`;
                 }
-
-                function escapeHtml(text) {
-                    const div = document.createElement('div');
-                    div.textContent = text;
-                    return div.innerHTML;
-                }
-
-                // Load all on page load
-                window.onload = () => {
-                    console.log('Veridat Explorer loaded');
-                    loadAll();
-                };
+                window.onload = loadAll;
             </script>
         </body>
         </html>
     `);
 });
 
-// Error handling middleware
-app.use((err, req, res, next) => {
-    console.error('Server error:', err);
-    res.status(500).json({
-        success: false,
-        error: err.message || 'Internal server error'
-    });
-});
-
-// Start server
 const PORT = config.port || 3000;
-const server = app.listen(PORT, () => {
-    console.log('='.repeat(50));
-    console.log('🚀 Veridat Explorer API Server Started!');
-    console.log('='.repeat(50));
+app.listen(PORT, () => {
+    console.log(`🚀 Veridat Explorer API running on port ${PORT}`);
+    console.log(`🔥 Using @hyperledger/fabric-gateway SDK`);
     console.log(`📍 Web Interface:  http://localhost:${PORT}`);
     console.log(`📍 API Endpoint:   http://localhost:${PORT}/api/hashes`);
+    console.log(`📍 Doc Query:      http://localhost:${PORT}/api/hash/{documentId}`);
+    console.log(`📍 Block Query:    http://localhost:${PORT}/api/block/txid/{txId}`);
     console.log(`📍 Health Check:   http://localhost:${PORT}/health`);
-    console.log('='.repeat(50));
-    console.log(`🔗 Channel:        ${config.channelName}`);
-    console.log(`🔗 Chaincode:      ${config.chaincodeName}`);
-    console.log('='.repeat(50));
-    console.log('💡 Tip: Make sure your Fabric network is running!');
-    console.log('='.repeat(50));
-});
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-    console.log('SIGTERM received, shutting down gracefully...');
-    server.close(() => {
-        console.log('Server closed');
-        process.exit(0);
-    });
-});
-
-process.on('SIGINT', () => {
-    console.log('\nSIGINT received, shutting down gracefully...');
-    server.close(() => {
-        console.log('Server closed');
-        process.exit(0);
-    });
 });
