@@ -421,7 +421,7 @@ app.get('/api/blockchain/info', async (req, res) => {
     }
 });
 
-// Get block info directly by transaction ID
+// Get block info directly by transaction ID (API endpoint - returns JSON)
 app.get('/api/block/txid/:txId', async (req, res) => {
     let gateway;
     let client;
@@ -445,6 +445,116 @@ app.get('/api/block/txid/:txId', async (req, res) => {
         if (gateway) gateway.close();
         if (client) client.close();
     }
+});
+
+// Block Explorer Page - Pretty HTML display for block info
+app.get('/block/:txId', (req, res) => {
+    const { txId } = req.params;
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Block Info - ${txId}</title>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                body { font-family: sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f7fa; }
+                .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; margin-bottom: 30px; }
+                .back-link { color: white; text-decoration: none; display: inline-block; margin-top: 10px; opacity: 0.9; }
+                .back-link:hover { opacity: 1; text-decoration: underline; }
+                .block-container { background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+                .block-info { background: #e3f2fd; padding: 20px; margin: 20px 0; border-radius: 8px; border-left: 4px solid #2196F3; }
+                .info-row { margin: 15px 0; padding: 12px; border-bottom: 1px solid #eee; }
+                .info-row:last-child { border-bottom: none; }
+                .label { font-weight: bold; color: #555; display: block; margin-bottom: 5px; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px; }
+                .value { color: #333; font-size: 16px; }
+                .hash { font-family: monospace; background: #f8f9fa; padding: 12px; word-break: break-all; border-radius: 5px; margin-top: 8px; font-size: 13px; line-height: 1.6; }
+                .loading { text-align: center; padding: 60px 20px; color: #666; font-size: 18px; }
+                .error { background: #ffebee; color: #c62828; padding: 20px; border-radius: 8px; border-left: 4px solid #c62828; }
+                .success-badge { display: inline-block; background: #4caf50; color: white; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: bold; margin-left: 10px; }
+                .error-badge { display: inline-block; background: #f44336; color: white; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: bold; margin-left: 10px; }
+                .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin: 20px 0; }
+                .stat-card { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 8px; text-align: center; }
+                .stat-value { font-size: 32px; font-weight: bold; margin: 10px 0; }
+                .stat-label { font-size: 14px; opacity: 0.9; text-transform: uppercase; letter-spacing: 1px; }
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>📦 PARA Block Explorer</h1>
+                <p>Transaction ID: <code style="background: rgba(255,255,255,0.2); padding: 5px 10px; border-radius: 4px;">${txId}</code></p>
+                <a href="/" class="back-link">← Back to Hash Explorer</a>
+            </div>
+            
+            <div class="block-container">
+                <div id="content" class="loading">
+                    <div>⏳ Loading block information...</div>
+                </div>
+            </div>
+
+            <script>
+                async function loadBlockInfo() {
+                    try {
+                        const res = await fetch('/api/block/txid/${txId}');
+                        const data = await res.json();
+                        
+                        if (!data.success) {
+                            document.getElementById('content').innerHTML = 
+                                '<div class="error"><strong>❌ Error:</strong> ' + (data.error || 'Block not found') + '</div>';
+                            return;
+                        }
+                        
+                        document.getElementById('content').innerHTML = \`
+                            <h2>Block Information <span class="success-badge">✓ FOUND</span></h2>
+                            
+                            <div class="stat-grid">
+                                <div class="stat-card">
+                                    <div class="stat-label">Block Number</div>
+                                    <div class="stat-value">\${data.blockNumber !== null ? data.blockNumber : 'N/A'}</div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-label">Block Size</div>
+                                    <div class="stat-value">\${data.blockSize ? (data.blockSize / 1024).toFixed(2) : 'N/A'} KB</div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-label">Transactions</div>
+                                    <div class="stat-value">\${data.transactionCount !== null ? data.transactionCount : 'N/A'}</div>
+                                </div>
+                            </div>
+
+                            <div class="block-info">
+                                <div class="info-row">
+                                    <span class="label">🆔 Transaction ID</span>
+                                    <div class="hash">\${data.transactionId}</div>
+                                </div>
+                                
+                                <div class="info-row">
+                                    <span class="label">📺 Channel</span>
+                                    <span class="value">\${data.channel}</span>
+                                </div>
+                                
+                                <div class="info-row">
+                                    <span class="label">🔗 Previous Block Hash</span>
+                                    <div class="hash">\${data.previousBlockHash || 'N/A'}</div>
+                                </div>
+                                
+                                <div class="info-row">
+                                    <span class="label">📊 Data Hash</span>
+                                    <div class="hash">\${data.dataHash || 'N/A'}</div>
+                                </div>
+                            </div>
+                        \`;
+                    } catch (error) {
+                        document.getElementById('content').innerHTML = 
+                            '<div class="error"><strong>❌ Error loading block info:</strong> ' + error.message + '</div>';
+                    }
+                }
+                
+                window.onload = loadBlockInfo;
+            </script>
+        </body>
+        </html>
+    `);
 });
 
 // Health check
@@ -577,5 +687,6 @@ app.listen(PORT, () => {
     console.log(`📍 API Endpoint:   http://localhost:${PORT}/api/hashes`);
     console.log(`📍 Doc Query:      http://localhost:${PORT}/api/hash/{documentId}`);
     console.log(`📍 Block Query:    http://localhost:${PORT}/api/block/txid/{txId}`);
+    console.log(`📍 Block Page:     http://localhost:${PORT}/block/{txId}`);
     console.log(`📍 Health Check:   http://localhost:${PORT}/health`);
 });
