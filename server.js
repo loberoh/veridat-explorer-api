@@ -447,6 +447,335 @@ app.get('/api/block/txid/:txId', async (req, res) => {
     }
 });
 
+// ===== NEW TRANSACTION EXPLORER ENDPOINTS =====
+
+// API endpoint - Get transaction details by TX ID
+app.get('/api/transaction/:txId', async (req, res) => {
+    let gateway;
+    let client;
+    try {
+        const { txId } = req.params;
+        console.log(`🔍 Querying transaction details for: ${txId}`);
+        
+        const connection = await connectToNetwork();
+        gateway = connection.gateway;
+        client = connection.client;
+        const contract = connection.contract;
+        const network = connection.network;
+
+        // 1. Find the document with this txId
+        const resultBytes = await contract.evaluateTransaction('GetAllHashes');
+        const resultString = new TextDecoder().decode(resultBytes);
+        const data = JSON.parse(resultString);
+
+        if (!data.data) {
+            return res.status(404).json({ 
+                success: false, 
+                error: 'No data available' 
+            });
+        }
+
+        const transaction = data.data.find(item => item.txId === txId);
+        
+        if (!transaction) {
+            return res.status(404).json({ 
+                success: false, 
+                error: 'Transaction ID not found in chaincode state' 
+            });
+        }
+
+        // 2. Get block info
+        const blockInfo = await getBlockInfoFromTxId(network, txId);
+
+        // 3. Combine both
+        res.json({
+            success: true,
+            transaction: {
+                documentId: transaction.documentID,
+                dataHash: transaction.hash,  // YOUR submitted hash
+                txId: transaction.txId,
+                timestamp: transaction.timestamp
+            },
+            blockInfo: blockInfo.success ? blockInfo : null
+        });
+
+    } catch (error) {
+        console.error(`❌ Query failed: ${error.message}`);
+        res.status(500).json({ success: false, error: error.message });
+    } finally {
+        if (gateway) gateway.close();
+        if (client) client.close();
+    }
+});
+
+// HTML Transaction Explorer Page - Pretty display
+app.get('/transaction/:txId', (req, res) => {
+    const { txId } = req.params;
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Transaction Explorer - ${txId}</title>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                body { 
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
+                    max-width: 1200px; 
+                    margin: 0 auto; 
+                    padding: 20px; 
+                    background: #f5f7fa; 
+                }
+                .header { 
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                    color: white; 
+                    padding: 30px; 
+                    border-radius: 10px; 
+                    margin-bottom: 30px; 
+                }
+                .back-link { 
+                    color: white; 
+                    text-decoration: none; 
+                    display: inline-block; 
+                    margin-top: 10px; 
+                    opacity: 0.9; 
+                }
+                .back-link:hover { opacity: 1; text-decoration: underline; }
+                
+                /* Main Data Hash Section */
+                .data-hash-section {
+                    background: white;
+                    padding: 40px;
+                    border-radius: 10px;
+                    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+                    margin-bottom: 30px;
+                    text-align: center;
+                }
+                .data-hash-title {
+                    font-size: 14px;
+                    text-transform: uppercase;
+                    letter-spacing: 2px;
+                    color: #667eea;
+                    font-weight: bold;
+                    margin-bottom: 20px;
+                }
+                .data-hash-value {
+                    font-family: 'Courier New', monospace;
+                    font-size: 18px;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    padding: 25px;
+                    border-radius: 8px;
+                    word-break: break-all;
+                    line-height: 1.6;
+                    box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3);
+                }
+                .document-id {
+                    margin-top: 20px;
+                    font-size: 14px;
+                    color: #666;
+                }
+                .document-id strong {
+                    color: #333;
+                }
+
+                /* Block Confirmation Section */
+                .confirmation-section {
+                    background: white;
+                    padding: 30px;
+                    border-radius: 10px;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                }
+                .section-title {
+                    font-size: 20px;
+                    color: #333;
+                    margin-bottom: 20px;
+                    padding-bottom: 10px;
+                    border-bottom: 2px solid #667eea;
+                }
+                
+                .stat-grid { 
+                    display: grid; 
+                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); 
+                    gap: 15px; 
+                    margin: 20px 0; 
+                }
+                .stat-card { 
+                    background: #f8f9fa;
+                    padding: 20px; 
+                    border-radius: 8px; 
+                    text-align: center;
+                    border: 2px solid #e9ecef;
+                }
+                .stat-value { 
+                    font-size: 28px; 
+                    font-weight: bold; 
+                    color: #667eea;
+                    margin: 10px 0; 
+                }
+                .stat-label { 
+                    font-size: 12px; 
+                    color: #666;
+                    text-transform: uppercase; 
+                    letter-spacing: 1px; 
+                }
+                
+                .info-row { 
+                    margin: 15px 0; 
+                    padding: 15px; 
+                    background: #f8f9fa;
+                    border-radius: 5px;
+                }
+                .info-label { 
+                    font-weight: bold; 
+                    color: #555; 
+                    display: block; 
+                    margin-bottom: 8px; 
+                    font-size: 12px; 
+                    text-transform: uppercase; 
+                    letter-spacing: 0.5px; 
+                }
+                .info-value { 
+                    color: #333; 
+                    font-size: 14px; 
+                }
+                .hash-box { 
+                    font-family: 'Courier New', monospace; 
+                    background: white; 
+                    padding: 12px; 
+                    word-break: break-all; 
+                    border-radius: 5px; 
+                    margin-top: 8px; 
+                    font-size: 13px; 
+                    line-height: 1.6;
+                    border: 1px solid #dee2e6;
+                }
+                
+                .loading { 
+                    text-align: center; 
+                    padding: 60px 20px; 
+                    color: #666; 
+                    font-size: 18px; 
+                }
+                .error { 
+                    background: #ffebee; 
+                    color: #c62828; 
+                    padding: 20px; 
+                    border-radius: 8px; 
+                    border-left: 4px solid #c62828; 
+                }
+                .success-badge { 
+                    display: inline-block; 
+                    background: #4caf50; 
+                    color: white; 
+                    padding: 6px 15px; 
+                    border-radius: 15px; 
+                    font-size: 12px; 
+                    font-weight: bold; 
+                    margin-left: 10px; 
+                }
+                .timestamp {
+                    color: #666;
+                    font-size: 14px;
+                    margin-top: 10px;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>🔍 Transaction Explorer</h1>
+                <p>Transaction ID: <code style="background: rgba(255,255,255,0.2); padding: 5px 10px; border-radius: 4px;">${txId}</code></p>
+                <a href="/" class="back-link">← Back to Hash Explorer</a>
+            </div>
+            
+            <div id="content" class="loading">
+                <div>⏳ Loading transaction details...</div>
+            </div>
+
+            <script>
+                async function loadTransactionDetails() {
+                    try {
+                        const res = await fetch('/api/transaction/${txId}');
+                        const data = await res.json();
+                        
+                        if (!data.success) {
+                            document.getElementById('content').innerHTML = 
+                                '<div class="error"><strong>❌ Error:</strong> ' + (data.error || 'Transaction not found') + '</div>';
+                            return;
+                        }
+                        
+                        const tx = data.transaction;
+                        const block = data.blockInfo;
+                        
+                        let blockHtml = '';
+                        if (block && block.success) {
+                            blockHtml = \`
+                                <div class="confirmation-section">
+                                    <h2 class="section-title">
+                                        📦 Blockchain Confirmation 
+                                        <span class="success-badge">✓ VERIFIED</span>
+                                    </h2>
+                                    
+                                    <div class="stat-grid">
+                                        <div class="stat-card">
+                                            <div class="stat-label">Block Number</div>
+                                            <div class="stat-value">\${block.blockNumber !== null ? block.blockNumber : 'N/A'}</div>
+                                        </div>
+                                        <div class="stat-card">
+                                            <div class="stat-label">Block Size</div>
+                                            <div class="stat-value">\${block.blockSize ? (block.blockSize / 1024).toFixed(2) : 'N/A'}</div>
+                                            <div class="stat-label" style="margin-top: 5px;">KB</div>
+                                        </div>
+                                        <div class="stat-card">
+                                            <div class="stat-label">Transactions in Block</div>
+                                            <div class="stat-value">\${block.transactionCount !== null ? block.transactionCount : 'N/A'}</div>
+                                        </div>
+                                        <div class="stat-card">
+                                            <div class="stat-label">Channel</div>
+                                            <div class="stat-value" style="font-size: 18px;">\${block.channel}</div>
+                                        </div>
+                                    </div>
+
+                                    <div class="info-row">
+                                        <span class="info-label">🔗 Previous Block Hash</span>
+                                        <div class="hash-box">\${block.previousBlockHash || 'N/A'}</div>
+                                    </div>
+                                    
+                                    <div class="info-row">
+                                        <span class="info-label">📊 Block Data Hash</span>
+                                        <div class="hash-box">\${block.dataHash || 'N/A'}</div>
+                                    </div>
+                                </div>
+                            \`;
+                        } else {
+                            blockHtml = '<div class="error">⚠️ Block confirmation details not available</div>';
+                        }
+                        
+                        document.getElementById('content').innerHTML = \`
+                            <div class="data-hash-section">
+                                <div class="data-hash-title">📄 YOUR SUBMITTED DATA HASH</div>
+                                <div class="data-hash-value">\${tx.dataHash}</div>
+                                <div class="document-id">
+                                    <strong>Document ID:</strong> \${tx.documentId}
+                                </div>
+                                \${tx.timestamp ? \`<div class="timestamp">⏰ Stored: \${tx.timestamp}</div>\` : ''}
+                            </div>
+                            
+                            \${blockHtml}
+                        \`;
+                    } catch (error) {
+                        document.getElementById('content').innerHTML = 
+                            '<div class="error"><strong>❌ Error loading transaction:</strong> ' + error.message + '</div>';
+                    }
+                }
+                
+                window.onload = loadTransactionDetails;
+            </script>
+        </body>
+        </html>
+    `);
+});
+
 // Block Explorer Page - Pretty HTML display for block info
 app.get('/block/:txId', (req, res) => {
     const { txId } = req.params;
@@ -688,5 +1017,6 @@ app.listen(PORT, () => {
     console.log(`📍 Doc Query:      http://localhost:${PORT}/api/hash/{documentId}`);
     console.log(`📍 Block Query:    http://localhost:${PORT}/api/block/txid/{txId}`);
     console.log(`📍 Block Page:     http://localhost:${PORT}/block/{txId}`);
+    console.log(`📍 Transaction:    http://localhost:${PORT}/transaction/{txId}`);
     console.log(`📍 Health Check:   http://localhost:${PORT}/health`);
 });
